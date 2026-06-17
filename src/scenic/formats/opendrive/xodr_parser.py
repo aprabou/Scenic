@@ -33,6 +33,73 @@ class OpenDriveWarning(UserWarning):
 def warn(message):
     warnings.warn(message, OpenDriveWarning, stacklevel=2)
 
+# helper function to convert <speed> element to m/s
+# might not be necessary either
+def parse_speed_to_mps(speed_elem):
+    """Convert an OpenDRIVE ``<speed>`` element to m/s."""
+    raw = speed_elem.get("max")
+    if raw in ("no limit", "undefined"):
+        return None
+    value = float(raw)
+    unit = speed_elem.get("unit", "m/s")
+    if unit == "m/s":
+        return value
+    elif unit == "km/h":
+        return value / 3.6
+    elif unit == "mph":
+        return value * 0.44704
+    else:
+        raise ValueError(f"unsupported speed unit: {unit!r}") 
+
+
+# OpenDRIVE road ``type`` attribute values -> Scenic ``tags`` on ``NetworkElement``.
+# Everything else (rural, bicycle) is mapped to the same value. 
+# This part may not even be necessary
+ROAD_TYPE_MAP = {"motorway": "highway",}
+
+# helper function to get the primary type record
+# key=lambda record: record[0] means the type record with the smallest s
+def _primary_type_record(type_records):
+    """Return the type record starting at the smallest s (usually s=0)."""
+    if not type_records:
+        return None
+    return min(type_records, key=lambda record: record[0])
+
+
+def speed_limit_from_type_records(type_records):
+    """Road speed limit in m/s from parsed ``<type>``/``<speed>`` records."""
+    record = _primary_type_record(type_records)
+    return None if record is None else record[2]
+
+
+def scenic_tags_from_type_records(type_records):
+    """Scenic semantic tags from parsed road ``<type>`` records."""
+    record = _primary_type_record(type_records)
+    if record is None:
+        return frozenset()
+    open_drive_type = record[1]
+    #normalize the open drive type to a scenic tag
+    tag = ROAD_TYPE_MAP.get(open_drive_type, open_drive_type)
+    return frozenset({tag}) if tag else frozenset()
+
+
+_SPEED_LIMIT_PROPAGATION_TYPES = (
+    roadDomain.LaneGroup,
+    roadDomain.RoadSection,
+    roadDomain.LaneSection,
+    roadDomain.Lane,
+)
+
+
+def propagate_speed_limit(speed_limit, elements):
+    """Copy a road speed limit down the lane hierarchy."""
+    if speed_limit is None:
+        return
+    for element in elements:
+        if isinstance(element, _SPEED_LIMIT_PROPAGATION_TYPES):
+            if element.speedLimit is None:
+                element.speedLimit = speed_limit
+
 
 def buffer_union(polys, tolerance=0.01):
     return polygonUnion(polys, buf=tolerance, tolerance=tolerance)
@@ -419,6 +486,8 @@ class Road:
 
         self.remappedStartLanes = None  # hack for handling spurious initial lane sections
 
+        self.type_records = []  # [(s, openDriveRoadType, speedLimitMps), ...]
+
     def get_ref_line_offset(self, s):
         if not self.offset:
             return 0
@@ -767,6 +836,13 @@ class Road:
 
     def toScenicRoad(self, tolerance):
         assert self.sec_points
+        road_speed_limit = speed_limit_from_type_records(self.type_records)
+        road_tags = scenic_tags_from_type_records(self.type_records)
+        if len(self.type_records) > 1:
+            warn(
+                f"road {self.id_} has {len(self.type_records)} type segments;"
+                " using the segment with smallest s for speedLimit and tags"
+            )
         allElements = []
         # Create lane and road sections
         roadSections = []
@@ -1192,8 +1268,11 @@ class Road:
             sections=roadSections,
             signals=tuple(roadSignals),
             crossings=(),  # TODO add these!
+            speedLimit=road_speed_limit,
+            tags=road_tags,
         )
         allElements.append(road)
+        propagate_speed_limit(road_speed_limit, allElements)
 
         # Set up parent references
         if forwardGroup:
@@ -1529,6 +1608,17 @@ class RoadMap:
                 succ_link = self.__parse_link(succ_elem, road, "end")
             else:
                 pred_link = succ_link = None
+
+            for type_elem in r.findall("type"):
+                s = float(type_elem.get("s"))
+                road_type = type_elem.get("type")
+                speed_elem = type_elem.find("speed")
+                speed_mps = (
+                    parse_speed_to_mps(speed_elem)
+                    if speed_elem is not None
+                    else None
+                )
+                road.type_records.append((s, road_type, speed_mps))
 
             if road.length < self.tolerance:
                 warn(
