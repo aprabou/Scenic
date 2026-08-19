@@ -930,22 +930,6 @@ class Signal:
         """Whether this signal lists the given OpenDRIVE priority semantic."""
         return priority in self.priorities
 
-    def _validity_hits_lane(self, lane: Lane) -> bool:
-        lo, hi = min(self.validity), max(self.validity)
-        return any(lo <= sec.openDriveID <= hi for sec in lane.sections)
-
-    def _validity_is_dummy(self, lane: Lane) -> bool:
-        """CARLA/RoadRunner writes ``fromLane=0 toLane=0`` (center lane only)."""
-        if self.validity is None:
-            return False
-        if self._validity_hits_lane(lane):
-            return False
-        road = lane.road
-        if road is not None:
-            return not any(self._validity_hits_lane(other) for other in road.lanes)
-        lo, hi = min(self.validity), max(self.validity)
-        return lo == 0 and hi == 0
-
     def affects(self, lane: Lane) -> bool:
         """Whether this signal applies to ``lane``.
 
@@ -955,15 +939,28 @@ class Signal:
         encode lamp facing, so a junction-contact light then applies only to
         the arriving side, not the road you turn into.
         """
-        if self.validity is not None and not self._validity_is_dummy(lane):
-            if not self._validity_hits_lane(lane):
+        validity_is_dummy = False
+        if self.validity is not None:
+            lo, hi = min(self.validity), max(self.validity)
+
+            def validity_hits(candidate):
+                return any(lo <= sec.openDriveID <= hi for sec in candidate.sections)
+
+            validity_hits_lane = validity_hits(lane)
+            if not validity_hits_lane:
+                road = lane.road
+                if road is not None:
+                    validity_is_dummy = not any(
+                        validity_hits(other) for other in road.lanes
+                    )
+                else:
+                    validity_is_dummy = lo == 0 and hi == 0
+            if not validity_is_dummy and not validity_hits_lane:
                 return False
-        elif self._validity_is_dummy(lane):
+        if validity_is_dummy:
             # CARLA 0–0 is not a lane range; orientation is lamp facing.
             # Junction-contact lights still only apply to the arriving side.
-            if self._is_junction_contact_halt(lane.road):
-                return self._lane_arrives_at_halt(lane)
-            return True
+            return self._lane_arrives_at_halt(lane)
         if self.orientation in (None, "none"):
             return True
         is_forward = any(sec.isForward for sec in lane.sections)
@@ -972,17 +969,6 @@ class Signal:
         if self.orientation == "-":
             return not is_forward
         return True
-
-    def kindLabel(self) -> str:
-        if self.isStop:
-            return "stop"
-        if self.isYield:
-            return "yield"
-        if self.isTrafficLight:
-            return "light"
-        if self.isStopLine:
-            return "line"
-        return "sig"
 
     def _isHaltLocation(self) -> bool:
         return (
@@ -1030,36 +1016,21 @@ class Signal:
             return candidates[0]
         return None
 
-    def _has_stopline_reference(self) -> bool:
-        for link in self.references:
-            if link.elementType != "signal":
-                continue
-            kind = (link.type or "").replace("_", "").lower()
-            if kind == "stopline":
-                return True
-        return False
-
-    def _is_junction_contact_halt(self, road) -> bool:
-        """True when `stoppingS` is a junction entry, not a painted/logical line.
-
-        Traffic lights without a stop-line reference use the road's junction
-        contact. That station is the *entry* to the junction; the opposite
-        direction at the same s is already leaving and must not halt there.
-        """
+    def _lane_arrives_at_halt(self, lane: Lane) -> bool:
+        """Whether ``lane`` is still traveling into a junction-contact halt."""
+        road = lane.road
         if road is None or self.stoppingS is None:
-            return False
+            return True
         if not self.isTrafficLight or self.sIsLogical or self._isHaltLocation():
-            return False
-        if self._has_stopline_reference():
-            return False
+            return True
+        for link in self.references:
+            if link.elementType == "signal":
+                kind = (link.type or "").replace("_", "").lower()
+                if kind == "stopline":
+                    return True
         length = road.centerline.length
         s = self.stoppingS
-        return abs(s) <= 1e-4 or abs(s - length) <= 1e-4
-
-    def _lane_arrives_at_halt(self, lane: Lane) -> bool:
-        """Whether ``lane`` is still traveling *into* a junction-contact halt."""
-        road = lane.road
-        if not self._is_junction_contact_halt(road):
+        if abs(s) > 1e-4 and abs(s - length) > 1e-4:
             return True
         is_forward = any(sec.isForward for sec in lane.sections)
         at_start = abs(self.stoppingS) <= 1e-4
@@ -1676,13 +1647,7 @@ class Network:
         elem = self.findPointIn(point, self._nominalDirElems, reject)
         return elem.nominalDirectionsAt(point) if elem is not None else ()
 
-    def show(
-        self,
-        labelIncomingLanes=False,
-        showCurbArrows=False,
-        showSignals=True,
-        labelSignals=True,
-    ):
+    def show(self, labelIncomingLanes=False, showCurbArrows=False):
         """Render a schematic of the road network for debugging.
 
         If you call this function directly, you'll need to subsequently call
@@ -1692,8 +1657,6 @@ class Network:
             labelIncomingLanes (bool): Whether to label the incoming lanes of
                 intersections with their indices in ``incomingLanes``.
             showCurbArrows (bool): Whether to draw arrows along the curb to show orientation
-            showSignals (bool): Whether to mark signal poles and halt points.
-            labelSignals (bool): Whether to annotate each pole with id / s / t.
         """
         import matplotlib.pyplot as plt
 
@@ -1758,62 +1721,3 @@ class Network:
                     x, y, _ = lane.centerline[-1]
                     plt.plot([x], [y], "*b")
                     plt.annotate(str(i), (x, y))
-
-        if showSignals:
-            pole_labeled = False
-            halt_labeled = False
-            for road in self.allRoads:
-                for sig in road.signals:
-                    if sig.position is not None:
-                        plt.plot(
-                            sig.position.x,
-                            sig.position.y,
-                            "s",
-                            color="#C04000",
-                            markersize=8,
-                            zorder=5,
-                            label=None if pole_labeled else "pole (device s,t)",
-                        )
-                        pole_labeled = True
-                        if labelSignals:
-                            extra = ""
-                            if sig.stoppingS is not None and sig.s is not None:
-                                if abs(sig.stoppingS - sig.s) > 0.2:
-                                    extra = f" halt@s={sig.stoppingS:.1f}"
-                            plt.annotate(
-                                f"{sig.kindLabel()} #{sig.openDriveID}\n"
-                                f"s={sig.s} t={sig.t}{extra}",
-                                (sig.position.x, sig.position.y),
-                                textcoords="offset points",
-                                xytext=(7, 7),
-                                fontsize=7,
-                                color="#802000",
-                                zorder=6,
-                            )
-                    for lane in road.lanes:
-                        pt = sig.stoppingPointOn(lane)
-                        if pt is None:
-                            continue
-                        plt.plot(
-                            pt.x,
-                            pt.y,
-                            "o",
-                            color="#00E8A0",
-                            markeredgecolor="black",
-                            markeredgewidth=0.7,
-                            markersize=9,
-                            zorder=6,
-                            label=None if halt_labeled else "halt (stoppingPointOn)",
-                        )
-                        halt_labeled = True
-                        if sig.position is not None:
-                            plt.plot(
-                                [sig.position.x, pt.x],
-                                [sig.position.y, pt.y],
-                                color="#C04000",
-                                linestyle=":",
-                                linewidth=0.8,
-                                zorder=4,
-                            )
-            if pole_labeled or halt_labeled:
-                plt.legend(loc="best", fontsize=8)
