@@ -184,6 +184,17 @@ MAP_APPROACH_SIGNAL = """<?xml version="1.0" encoding="UTF-8"?>
 </OpenDRIVE>
 """
 
+# Town01-style: dummy validity 0-0, pole next to the junction, orientation
+# names the other travel direction (CARLA lamp facing, not lane validity).
+MAP_CARLA_DUMMY_VALIDITY = MAP_APPROACH_SIGNAL.replace(
+    'orientation="+" zOffset="5" type="1000001" country="OpenDRIVE"\n'
+    '              subtype="-1" value="-1"/>',
+    'orientation="-" zOffset="5" type="1000001" country="OpenDRIVE"\n'
+    '              subtype="-1" value="-1">\n'
+    '        <validity fromLane="0" toLane="0"/>\n'
+    "      </signal>",
+)
+
 MAP_T_JUNCTION = """<?xml version="1.0" encoding="UTF-8"?>
 <OpenDRIVE>
   <header revMajor="1" revMinor="6" name="t_junction_turn_signals" version="1.0"/>
@@ -643,3 +654,235 @@ def test_priority_type_disagreement_warns_and_prefers_priorities(tmp_path):
     # Lane -2: unchanged legacy light
     assert by_start[-2].signal.isTrafficLight
     assert by_start[-2].signal.priorities == ()
+
+
+# Placement / <reference> / deprecated <positionRoad> (stop-line derivation).
+# One road, two travel directions, three signals:
+#   1 — 1.8+ light that <reference>s a stop line
+#   2 — the stop line
+#   3 — pre-1.8 logical-s signal with <positionRoad> pole offset
+MAP_SIGNAL_PLACEMENT = """<?xml version="1.0" encoding="UTF-8"?>
+<OpenDRIVE>
+  <header revMajor="1" revMinor="8" name="signal_placement" version="1.0"/>
+  <road name="TwoWay" length="20.0" id="1" junction="-1" rule="RHT">
+    <planView>
+      <geometry s="0" x="0.0" y="0.0" hdg="0.0" length="20.0"><line/></geometry>
+    </planView>
+    <lanes>
+      <laneOffset s="0" a="0" b="0" c="0" d="0"/>
+      <laneSection s="0">
+        <center><lane id="0" type="none" level="false"/></center>
+        <right>
+          <lane id="-1" type="driving" level="false">
+            <width sOffset="0" a="3.5" b="0" c="0" d="0"/>
+          </lane>
+        </right>
+        <left>
+          <lane id="1" type="driving" level="false">
+            <width sOffset="0" a="3.5" b="0" c="0" d="0"/>
+          </lane>
+        </left>
+      </laneSection>
+    </lanes>
+    <signals>
+      <signal s="2.0" t="-4.0" id="1" name="light" dynamic="yes"
+              orientation="+" zOffset="5" type="1000001" country="OpenDRIVE"
+              subtype="-1" value="-1">
+        <validity fromLane="-1" toLane="-1"/>
+        <reference elementId="2" elementType="signal" type="stopline"/>
+      </signal>
+      <signal s="18.0" t="0.0" id="2" name="stop_line" dynamic="no"
+              orientation="none" zOffset="0" type="-1" country="OpenDRIVE"
+              subtype="-1" value="-1">
+        <semantics><priority type="stopLine"/></semantics>
+      </signal>
+      <signal s="10.0" t="-1.75" id="3" name="legacy_logical" dynamic="no"
+              orientation="-" zOffset="2" type="206" country="OpenDRIVE"
+              subtype="-1" value="-1">
+        <positionRoad roadId="1" s="12.0" t="-4.0" zOffset="2" hOffset="0"/>
+      </signal>
+    </signals>
+  </road>
+</OpenDRIVE>
+"""
+
+
+def _signals_by_id(network):
+    return {sig.openDriveID: sig for road in network.roads for sig in road.signals}
+
+
+def test_validity_lanes_expose_placement_and_affects(tmp_path):
+    """Existing per-lane lights keep s/t/validity; affects() follows validity."""
+    network = load_network(tmp_path, MAP_VALIDITY_LANES)
+    by_start = {open_drive_id(m.startLane): m for m in all_maneuvers(network)}
+    for lid, man in by_start.items():
+        sig = man.signal
+        assert sig.s == 1.0
+        assert sig.t is not None
+        assert sig.orientation == "+"
+        assert sig.validity is not None
+        lo, hi = sig.validity
+        assert lo <= lid <= hi
+        assert sig.affects(man.startLane)
+        assert not sig.sIsLogical
+        assert sig.references == ()
+        for other_lid, other in by_start.items():
+            if other_lid != lid and not (lo <= other_lid <= hi):
+                assert not sig.affects(other.startLane)
+
+
+def test_signal_reference_and_logical_s_parsed(tmp_path):
+    """<reference> and deprecated <positionRoad> survive conversion."""
+    from scenic.domains.driving.roads import SignalLink
+
+    network = load_network(tmp_path, MAP_SIGNAL_PLACEMENT)
+    by_id = _signals_by_id(network)
+
+    light = by_id["1"]
+    assert light.s == 2.0
+    assert light.t == -4.0
+    assert light.orientation == "+"
+    assert light.validity == (-1, -1)
+    assert not light.sIsLogical
+    assert light.references == (
+        SignalLink(elementId="2", elementType="signal", type="stopline"),
+    )
+    assert light.stoppingS == 18.0  # referenced stop line, not the pole
+
+    line = by_id["2"]
+    assert line.s == 18.0
+    assert line.isStopLine
+    assert line.orientation == "none"
+    assert line.references == ()
+    assert line.stoppingS == 18.0
+
+    legacy = by_id["3"]
+    assert legacy.s == 10.0
+    assert legacy.sIsLogical
+    assert legacy.orientation == "-"
+    assert legacy.isStop
+    assert legacy.stoppingS == 10.0  # logical @s, not <positionRoad>
+
+
+def test_affects_uses_validity_then_orientation(tmp_path):
+    """orientation=none spans both directions; +/- and validity restrict."""
+    network = load_network(tmp_path, MAP_SIGNAL_PLACEMENT)
+    by_id = _signals_by_id(network)
+    forward = next(lane for lane in network.roads[0].lanes if open_drive_id(lane) == -1)
+    backward = next(lane for lane in network.roads[0].lanes if open_drive_id(lane) == 1)
+
+    light = by_id["1"]
+    assert light.affects(forward)
+    assert not light.affects(backward)
+
+    line = by_id["2"]
+    assert line.affects(forward)
+    assert line.affects(backward)
+
+    legacy = by_id["3"]
+    assert not legacy.affects(forward)
+    assert legacy.affects(backward)
+
+
+def test_carla_style_light_stops_at_junction_contact(tmp_path):
+    """Pole-only approach light: halt at the junction, not at the pole ``s``."""
+    network = load_network(tmp_path, MAP_APPROACH_SIGNAL)
+    light = _signals_by_id(network)["201"]
+    assert light.s == 18.0
+    assert light.isTrafficLight
+    assert light.references == ()
+    assert not light.sIsLogical
+    assert light.stoppingS == 20.0
+
+
+def test_connector_light_has_no_invented_stopping_s(tmp_path):
+    """Lights on a connecting road have no junction-contact fallback."""
+    network = load_network(tmp_path, MAP_VALIDITY_LANES)
+    for man in all_maneuvers(network):
+        assert man.signal.s == 1.0
+        assert man.signal.stoppingS is None
+        assert man.signal.stoppingPointOn(man.startLane) is None
+
+
+def _xy(pt, x, y, tol=0.05):
+    assert pt is not None
+    assert abs(pt.x - x) < tol, (pt.x, x)
+    assert abs(pt.y - y) < tol, (pt.y, y)
+
+
+def test_stopping_point_on_uses_station_not_pole(tmp_path):
+    """Same stoppingS, both directions: different lane points, not the pole t."""
+    network = load_network(tmp_path, MAP_SIGNAL_PLACEMENT)
+    by_id = _signals_by_id(network)
+    road = network.roads[0]
+    forward = next(lane for lane in road.lanes if open_drive_id(lane) == -1)
+    backward = next(lane for lane in road.lanes if open_drive_id(lane) == 1)
+
+    light = by_id["1"]
+    _xy(light.position, 2.0, -4.0)
+    _xy(light.stoppingPointOn(forward), 18.0, -1.75)
+    assert light.stoppingPointOn(backward) is None
+
+    line = by_id["2"]
+    _xy(line.stoppingPointOn(forward), 18.0, -1.75)
+    _xy(line.stoppingPointOn(backward), 18.0, 1.75)
+
+    legacy = by_id["3"]
+    assert legacy.stoppingPointOn(forward) is None
+    _xy(legacy.stoppingPointOn(backward), 10.0, 1.75)
+
+
+def test_stopping_point_on_carla_approach_is_junction(tmp_path):
+    """Approach light's halt point is the junction contact, per lane."""
+    network = load_network(tmp_path, MAP_APPROACH_SIGNAL)
+    light = _signals_by_id(network)["201"]
+    approach = next(road for road in network.roads if road.id == 1)
+    by_lid = {open_drive_id(lane): lane for lane in approach.lanes}
+    _xy(light.stoppingPointOn(by_lid[-1]), 20.0, -1.75)
+    _xy(light.stoppingPointOn(by_lid[-2]), 20.0, -5.25)
+    _xy(light.position, 18.0, -3.5)
+
+
+def test_carla_dummy_validity_still_halts_at_near_junction(tmp_path):
+    """Town01-style 0-0 validity + opposite orientation still yields a halt."""
+    network = load_network(tmp_path, MAP_CARLA_DUMMY_VALIDITY)
+    light = _signals_by_id(network)["201"]
+    approach = next(road for road in network.roads if road.id == 1)
+    by_lid = {open_drive_id(lane): lane for lane in approach.lanes}
+    assert light.validity == (0, 0)
+    assert light.orientation == "-"
+    assert light.stoppingS == 20.0
+    assert light.affects(by_lid[-1])
+    assert light.affects(by_lid[-2])
+    _xy(light.stoppingPointOn(by_lid[-1]), 20.0, -1.75)
+    _xy(light.stoppingPointOn(by_lid[-2]), 20.0, -5.25)
+
+
+def test_traffic_light_picks_nearest_junction_not_orientation():
+    """Pole next to s=0 wins over orientation=+ pointing at the far junction."""
+    from scenic.domains.driving.roads import Signal
+
+    light = Signal(
+        uid="signal360",
+        openDriveID=360,
+        country="OpenDRIVE",
+        type="1000001",
+        subtype="-1",
+        priorities=(),
+        s=2.15,
+        t=5.0,
+        orientation="+",
+    )
+    assert light.resolveStoppingS({}, plus_contact=157.5, minus_contact=0.0) == 0.0
+
+
+def test_halt_point_ahead_picks_nearest_on_lane(tmp_path):
+    """haltPointAhead is the next stop along the lane, not behind the ego."""
+    from scenic.core.vectors import Vector
+
+    network = load_network(tmp_path, MAP_SIGNAL_PLACEMENT)
+    road = network.roads[0]
+    forward = next(lane for lane in road.lanes if open_drive_id(lane) == -1)
+    ahead = forward.haltPointAhead(Vector(1, -1.75))
+    _xy(ahead, 18.0, -1.75)
+    assert forward.haltPointAhead(Vector(19, -1.75)) is None
