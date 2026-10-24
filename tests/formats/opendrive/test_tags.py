@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from scenic.formats.opendrive.xodr_parser import Junction, RoadMap
+import pytest
+
+from scenic.formats.opendrive.xodr_parser import Junction, OpenDriveWarning, RoadMap
 
 from .conftest import (
     TWO_LANE_SECTIONS,
@@ -27,7 +29,8 @@ def test_map_tags_from_all_type_segments_propagate(tmp_path):
         '<type s="0" type="motorway"><speed max="120" unit="km/h"/></type>'
         '<type s="10" type="town"><speed max="50" unit="km/h"/></type>'
     )
-    road = parse_scenic_network(tmp_path, road_extras=road_extras).roads[0]
+    with pytest.warns(OpenDriveWarning, match="spans multiple speed limits"):
+        road = parse_scenic_network(tmp_path, road_extras=road_extras).roads[0]
     assert road.tags == frozenset({"motorway", "town"})
     assert_road_tags_propagated_to_groups(road)
     assert road.sections[0].tags == road.tags

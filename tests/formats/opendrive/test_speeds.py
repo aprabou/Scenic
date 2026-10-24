@@ -12,17 +12,19 @@ def test_type_speeds_are_sorted_and_looked_up_along_the_road(tmp_path):
         '<type s="10" type="town"><speed max="30" unit="m/s"/></type>'
         '<type s="0" type="town"><speed max="45" unit="m/s"/></type>'
     )
-    network = parse_scenic_network(tmp_path, road_extras=road_extras)
+    with pytest.warns(OpenDriveWarning, match="spans multiple speed limits"):
+        network = parse_scenic_network(tmp_path, road_extras=road_extras)
     lane_section = network.elements["road7"].lanes[0].sections[0]
     assert lane_section.speedLimitAt(2.0) == pytest.approx(45.0)
     assert lane_section.speedLimitAt(12.0) == pytest.approx(30.0)
 
 
 def test_lane_speed_ranges_on_scenic_lane_section(tmp_path):
-    network = parse_scenic_network(
-        tmp_path,
-        lanes_xml=lane_xml(-1, speeds=((0, 20, "m/s"), (5, 30, "m/s"))),
-    )
+    with pytest.warns(OpenDriveWarning, match="spans multiple speed limits"):
+        network = parse_scenic_network(
+            tmp_path,
+            lanes_xml=lane_xml(-1, speeds=((0, 20, "m/s"), (5, 30, "m/s"))),
+        )
     lane_section = network.elements["road7"].sections[0].lanes[0]
 
     assert lane_section.speedLimit == pytest.approx(20.0)
@@ -41,11 +43,12 @@ def test_lane_speed_ranges_on_scenic_lane_section(tmp_path):
 
 
 def test_unspecified_lane_stretch_uses_road_speed(tmp_path):
-    network = parse_scenic_network(
-        tmp_path,
-        lanes_xml=lane_xml(-1, speeds=((5, 30, "m/s"),)),
-        road_extras='<type s="0" type="town"><speed max="20" unit="m/s"/></type>',
-    )
+    with pytest.warns(OpenDriveWarning, match="spans multiple speed limits"):
+        network = parse_scenic_network(
+            tmp_path,
+            lanes_xml=lane_xml(-1, speeds=((5, 30, "m/s"),)),
+            road_extras='<type s="0" type="town"><speed max="20" unit="m/s"/></type>',
+        )
     lane_section = network.elements["road7"].sections[0].lanes[0]
     assert lane_section.speedLimitRanges == (
         (0.0, 20.0),
@@ -56,11 +59,12 @@ def test_unspecified_lane_stretch_uses_road_speed(tmp_path):
 
 
 def test_lane_speed_ranges_on_backward_lane(tmp_path):
-    network = parse_scenic_network(
-        tmp_path,
-        lanes_xml=lane_xml(1, speeds=((0, 20, "m/s"), (5, 30, "m/s"))),
-        lane_side="left",
-    )
+    with pytest.warns(OpenDriveWarning, match="spans multiple speed limits"):
+        network = parse_scenic_network(
+            tmp_path,
+            lanes_xml=lane_xml(1, speeds=((0, 20, "m/s"), (5, 30, "m/s"))),
+            lane_side="left",
+        )
     lane_section = network.elements["road7"].sections[0].lanes[0]
     assert lane_section.speedLimitRanges == (
         (0.0, 20.0),
@@ -76,11 +80,12 @@ def test_lane_speed_ranges_on_curved_road(tmp_path):
         <arc curvature="0.05"/>
       </geometry>
     </planView>"""
-    network = parse_scenic_network(
-        tmp_path,
-        plan_view=plan_view,
-        lanes_xml=lane_xml(-1, speeds=((0, 20, "m/s"), (10, 30, "m/s"))),
-    )
+    with pytest.warns(OpenDriveWarning, match="spans multiple speed limits"):
+        network = parse_scenic_network(
+            tmp_path,
+            plan_view=plan_view,
+            lanes_xml=lane_xml(-1, speeds=((0, 20, "m/s"), (10, 30, "m/s"))),
+        )
     lane_section = network.elements["road7"].sections[0].lanes[0]
     assert lane_section.speedLimitRanges == (
         (0.0, 20.0),
